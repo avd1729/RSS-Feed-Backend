@@ -1,93 +1,81 @@
 package main
 
 import (
-	"context"
+	"encoding/xml"
 	"fmt"
-	"log"
+	"io/ioutil"
 	"net/http"
-	"time"
-
-	"github.com/gin-gonic/gin"
-	"github.com/jackc/pgx/v5"
+	"sync"
 )
 
-// Database connection string
-const dbURL = "postgres://postgres:pass@localhost:5432/rss"
-
-// Post struct
-type Post struct {
-	Title       string
-	Link        string
-	Description string
-	PubDate     time.Time
+type Rss struct {
+	XMLName xml.Name   `xml:"rss"`
+	Channel RssChannel `xml:"channel"`
 }
 
-// Fetch posts from PostgreSQL
-func fetchPosts(conn *pgx.Conn) ([]Post, error) {
-	rows, err := conn.Query(context.Background(), "SELECT title, link, description, pub_date FROM posts ORDER BY pub_date DESC")
+type RssChannel struct {
+	Title string    `xml:"title"`
+	Items []RssItem `xml:"item"`
+}
+
+type RssItem struct {
+	Title       string `xml:"title"`
+	Link        string `xml:"link"`
+	Description string `xml:"description"`
+}
+
+// List of external RSS sources
+var rssSources = []string{
+	"https://rss.cnn.com/rss/edition.rss",
+	"https://feeds.bbci.co.uk/news/rss.xml",
+}
+
+func fetchRss(url string, wg *sync.WaitGroup, ch chan<- []RssItem) {
+	defer wg.Done()
+	resp, err := http.Get(url)
 	if err != nil {
-		return nil, err
+		fmt.Println("Error fetching RSS:", err)
+		ch <- nil
+		return
 	}
-	defer rows.Close()
+	defer resp.Body.Close()
 
-	var posts []Post
-	for rows.Next() {
-		var p Post
-		if err := rows.Scan(&p.Title, &p.Link, &p.Description, &p.PubDate); err != nil {
-			return nil, err
-		}
-		posts = append(posts, p)
-	}
-	return posts, nil
+	data, _ := ioutil.ReadAll(resp.Body)
+	var rss Rss
+	xml.Unmarshal(data, &rss)
+	ch <- rss.Channel.Items
 }
 
-// Generate RSS XML from posts
-func generateRSS(posts []Post) string {
-	rss := `<?xml version="1.0" encoding="UTF-8" ?>
-<rss version="2.0">
-    <channel>
-        <title>My Blog</title>
-        <link>https://example.com</link>
-        <description>Latest blog posts</description>`
+func aggregateRss() []RssItem {
+	var wg sync.WaitGroup
+	ch := make(chan []RssItem, len(rssSources))
 
-	for _, post := range posts {
-		rss += fmt.Sprintf(`
-        <item>
-            <title>%s</title>
-            <link>%s</link>
-            <description>%s</description>
-            <pubDate>%s</pubDate>
-        </item>`, post.Title, post.Link, post.Description, post.PubDate.Format(time.RFC1123Z))
+	for _, url := range rssSources {
+		wg.Add(1)
+		go fetchRss(url, &wg, ch)
 	}
 
-	rss += `
-    </channel>
-</rss>`
-	return rss
+	wg.Wait()
+	close(ch)
+
+	var allItems []RssItem
+	for items := range ch {
+		if items != nil {
+			allItems = append(allItems, items...)
+		}
+	}
+	return allItems
+}
+
+func rssHandler(w http.ResponseWriter, r *http.Request) {
+	items := aggregateRss()
+	xmlData, _ := xml.MarshalIndent(Rss{Channel: RssChannel{Title: "Aggregated RSS", Items: items}}, "", "  ")
+	w.Header().Set("Content-Type", "application/xml")
+	w.Write(xmlData)
 }
 
 func main() {
-	// Connect to PostgreSQL
-	conn, err := pgx.Connect(context.Background(), dbURL)
-	if err != nil {
-		log.Fatalf("Unable to connect to database: %v\n", err)
-	}
-	defer conn.Close(context.Background())
-
-	r := gin.Default()
-
-	// RSS feed endpoint
-	r.GET("/rss", func(c *gin.Context) {
-		posts, err := fetchPosts(conn)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch posts"})
-			return
-		}
-
-		xml := generateRSS(posts)
-		c.Data(http.StatusOK, "application/rss+xml", []byte(xml))
-	})
-
-	// Start server on port 8080
-	r.Run(":8080")
+	http.HandleFunc("/rss", rssHandler)
+	fmt.Println("Server started at :8080")
+	http.ListenAndServe(":8080", nil)
 }
